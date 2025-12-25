@@ -1,0 +1,344 @@
+name: Build OpenWrt (CMCC RAX3000M NAND 高功率版)
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt
+  REPO_BRANCH: openwrt-23.05
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: 23.05-diy-part1.sh
+  DIY_P2_SH: 23.05-diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  DEVICE_NAME: cmcc_rax3000m-nand
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    # 新增：步骤失败时继续，便于定位最终错误
+    continue-on-error: false
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment (修复工具链+版本兼容)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 复用模板的清理逻辑，新增工具链修复
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        # 安装模板的基础依赖 + 补充系统级bison/flex/m4（移除版本限制）
+        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004) bison flex m4 libfl2 libfl-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+        sudo timedatectl set-timezone "$TZ"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
+        # 验证核心依赖文件（解决m4sugar.m4缺失）
+        if [ -f /usr/share/bison/m4sugar/m4sugar.m4 ]; then
+          echo "✅ 系统级bison依赖文件完整"
+        else
+          sudo apt-get -qq install --reinstall bison bison-doc
+        fi
+        # 新增：安装git-lfs，解决部分Feeds克隆失败
+        sudo apt-get -qq install git-lfs > /dev/null 2>&1
+        git lfs install > /dev/null 2>&1
+
+    - name: Clone source code (复用模板路径逻辑+Feeds预检查)
+      working-directory: /workdir
+      run: |
+        df -hT $PWD
+        # 新增：浅克隆源码，提升速度+减少失败
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        # 关键修复：禁用OpenWrt工具链编译，强制使用系统级工具
+        cd $GITHUB_WORKSPACE/openwrt
+        # 删除bison/flex/m4编译项
+        sed -i '/^tools-y += / s/bison //; /^tools-y += / s/flex //; /^tools-y += / s/m4 //' tools/Makefile
+        sed -i '/compile: / s/tools\/bison\/compile //; /compile: / s/tools\/flex\/compile //; /compile: / s/tools\/m4\/compile //' tools/Makefile
+        # 强制系统工具路径优先级
+        echo 'export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$(PATH)' >> include/host.mk
+        # 新增：备份原始feeds.conf.default，避免重复添加
+        cp -f feeds.conf.default feeds.conf.default.bak
+
+    - name: Load custom feeds (修复Feeds添加逻辑+严格校验)
+      id: load_feeds
+      run: |
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
+        cd openwrt
+        # 核心修复：执行DIY脚本时严格校验，失败则终止（Feeds是编译基础）
+        if ! $GITHUB_WORKSPACE/$DIY_P1_SH 2>&1 | tee diy_part1.log; then
+          echo -e "\033[31m❌ DIY-P1脚本执行失败，终止编译！\033[0m"
+          cat diy_part1.log
+          exit 1
+        fi
+        # 新增：检查Feeds目录是否存在，缺失则手动克隆
+        FEEDS_CHECK_LIST=("small" "kenzo")
+        for feed in "${FEEDS_CHECK_LIST[@]}"; do
+          if [ ! -d "feeds/$feed" ]; then
+            echo -e "\033[33m⚠️ Feeds/$feed 缺失，尝试手动克隆...\033[0m"
+            case $feed in
+              "small")
+                git clone --depth 1 -b openwrt-23.05 https://github.com/kenzok8/small.git feeds/small || {
+                  echo -e "\033[31m❌ 手动克隆small Feeds失败，终止编译\033[0m"
+                  exit 1
+                }
+                ;;
+              "kenzo")
+                git clone --depth 1 -b openwrt-23.05 https://github.com/kenzok8/openwrt-packages.git feeds/kenzo || {
+                  echo -e "\033[31m❌ 手动克隆kenzo Feeds失败，终止编译\033[0m"
+                  exit 1
+                }
+                ;;
+            esac
+          fi
+        done
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Update feeds (修复Feeds更新逻辑+重试机制)
+      id: update_feeds
+      run: |
+        cd openwrt
+        # 新增：3次重试机制，解决网络波动导致的更新失败
+        RETRY_COUNT=3
+        RETRY_INTERVAL=5
+        for ((i=1; i<=RETRY_COUNT; i++)); do
+          echo -e "\033[32m🔧 第 $i 次更新Feeds...\033[0m"
+          if ./scripts/feeds update -a 2>&1 | tee feeds_update.log; then
+            echo -e "\033[32m✅ Feeds更新成功！\033[0m"
+            break
+          fi
+          if [ $i -eq $RETRY_COUNT ]; then
+            echo -e "\033[31m❌ Feeds更新失败（重试$RETRY_COUNT次），终止编译！\033[0m"
+            cat feeds_update.log
+            exit 1
+          fi
+          sleep $RETRY_INTERVAL
+        done
+
+    - name: Install feeds (修复Feeds安装逻辑+缺失检查)
+      id: install_feeds
+      run: |
+        cd openwrt
+        # 新增：先安装基础Feeds，再安装自定义Feeds
+        if ! ./scripts/feeds install -a 2>&1 | tee feeds_install.log; then
+          echo -e "\033[31m❌ Feeds全量安装失败，终止编译！\033[0m"
+          cat feeds_install.log
+          exit 1
+        fi
+        # 单独安装rtp2httpd，失败则手动克隆
+        if ! ./scripts/feeds install rtp2httpd luci-app-rtp2httpd 2>&1 | tee rtp2httpd_install.log; then
+          echo -e "\033[33m⚠️ 自动安装rtp2httpd失败，尝试手动克隆...\033[0m"
+          mkdir -p package/custom/rtp2httpd
+          git clone --depth 1 https://github.com/stackia/rtp2httpd.git package/custom/rtp2httpd || {
+            echo -e "\033[31m❌ 手动克隆rtp2httpd失败，终止编译\033[0m"
+            exit 1
+          }
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Load custom configuration (复用模板逻辑+注入设备配置)
+      id: load_config
+      run: |
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
+        cd openwrt
+        # 注入RAX3000M设备配置
+        sed -i '/CONFIG_TARGET_mediatek_filogic_DEVICE_/d' .config
+        echo "CONFIG_TARGET_mediatek_filogic_DEVICE_${DEVICE_NAME}=y" >> .config
+        # 执行DIY-P2脚本，失败则终止
+        if ! $GITHUB_WORKSPACE/$DIY_P2_SH 2>&1 | tee diy_part2.log; then
+          echo -e "\033[31m❌ DIY-P2脚本执行失败，终止编译！\033[0m"
+          cat diy_part2.log
+          exit 1
+        fi
+        # 新增：验证核心配置是否存在
+        if ! grep -q "CONFIG_TARGET_mediatek_filogic_DEVICE_${DEVICE_NAME}=y" .config; then
+          echo -e "\033[31m❌ 设备配置注入失败，终止编译！\033[0m"
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: SSH connection to Actions (复用模板逻辑)
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      env:
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    - name: Download package (复用模板+单线程修复+重试)
+      id: package
+      run: |
+        cd openwrt
+        # 强制使用系统工具生成配置
+        export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+        make defconfig || {
+          echo -e "\033[31m❌ 生成默认配置失败，终止编译！\033[0m"
+          exit 1
+        }
+        # 新增：3次重试下载依赖，解决网络问题
+        RETRY_COUNT=3
+        RETRY_INTERVAL=10
+        for ((i=1; i<=RETRY_COUNT; i++)); do
+          echo -e "\033[32m🔧 第 $i 次下载依赖包...\033[0m"
+          if make download -j1 2>&1 | tee download.log; then
+            echo -e "\033[32m✅ 依赖下载成功！\033[0m"
+            break
+          fi
+          if [ $i -eq $RETRY_COUNT ]; then
+            echo -e "\033[31m❌ 依赖下载失败（重试$RETRY_COUNT次），终止编译！\033[0m"
+            cat download.log
+            exit 1
+          fi
+          sleep $RETRY_INTERVAL
+        done
+        # 清理无效依赖
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Compile the firmware (核心修复：单线程+系统工具+详细日志)
+      id: compile
+      run: |
+        cd openwrt
+        # 全程强制系统工具路径
+        export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+        # 复用模板的编译降级逻辑，但默认单线程（稳定优先）
+        echo -e "\033[32m🔧 开始单线程编译RAX3000M固件...\033[0m"
+        # 新增：输出编译详细日志，便于定位错误
+        make -j1 V=s 2>&1 | tee compile.log || {
+          echo -e "\033[31m❌ 固件编译失败，关键日志如下：\033[0m"
+          tail -200 compile.log
+          exit 1
+        }
+        # 验证编译产物是否存在
+        if [ ! -d "bin/targets" ]; then
+          echo -e "\033[31m❌ 未生成编译产物，终止编译！\033[0m"
+          exit 1
+        fi
+        echo "status=success" >> $GITHUB_OUTPUT
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+    - name: Check space usage (复用模板逻辑)
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory (复用模板逻辑)
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
+      with:
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files (修复路径不存在+严格校验)
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        # 新增：检查编译产物路径是否存在
+        FIRMWARE_PATH="openwrt/bin/targets/mediatek/filogic"
+        if [ ! -d "$FIRMWARE_PATH" ]; then
+          echo -e "\033[31m❌ 固件路径 $FIRMWARE_PATH 不存在，终止整理！\033[0m"
+          exit 1
+        fi
+        cd "$FIRMWARE_PATH"
+        # 清理冗余文件
+        rm -rf packages *.buildinfo *.manifest *.json *bl2.bin
+        # 仅保留RAX3000M的sysupgrade固件（精简）
+        FIRMWARE_FILES=$(ls *cmcc_rax3000m*sysupgrade*.bin 2>/dev/null | wc -l)
+        if [ $FIRMWARE_FILES -eq 0 ]; then
+          echo -e "\033[31m❌ 未找到RAX3000M sysupgrade固件，终止整理！\033[0m"
+          exit 1
+        fi
+        rm -rf !(*cmcc_rax3000m*sysupgrade*.bin)
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory (复用模板逻辑)
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Upload firmware to cowtransfer (复用模板逻辑)
+      id: cowtransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_COWTRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer cow --block 2621440 -s -p 64 --no-progress ${FIRMWARE} 2>&1 | tee cowtransfer.log
+        echo "::warning file=cowtransfer.com::$(cat cowtransfer.log | grep https)"
+        echo "url=$(cat cowtransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to WeTransfer (复用模板逻辑)
+      id: wetransfer
+      if: steps.organize.outputs.status == 'success' && env.UPLOAD_WETRANSFER == 'true' && !cancelled()
+      run: |
+        curl -fsSL git.io/file-transfer | sh
+        ./transfer wet -s -p 16 --no-progress ${FIRMWARE} 2>&1 | tee wetransfer.log
+        echo "::warning file=wetransfer.com::$(cat wetransfer.log | grep https)"
+        echo "url=$(cat wetransfer.log | grep https | cut -f3 -d" ")" >> $GITHUB_OUTPUT
+
+    - name: Generate release tag (适配RAX3000M固件信息)
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M-immortalwrt23.05-cmcc_rax3000m-nand")" >> $GITHUB_OUTPUT
+        touch release.txt
+        echo "CMCC RAX3000M NAND版 高功率固件" >> release.txt
+        echo "后台：192.168.1.1（默认）/ 192.168.6.1（可选）" >> release.txt
+        echo "账号：root" >> release.txt
+        echo "密码：无" >> release.txt
+        echo "内核版本：5.15.195" >> release.txt
+        echo "MT76驱动：7a71a9f（高功率版）" >> release.txt
+        echo "WiFi功率：2.4G=28dBm / 5G=26dBm" >> release.txt
+        echo "编译源码：https://github.com/immortalwrt/immortalwrt (openwrt-23.05)" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release (复用模板逻辑)
+      uses: softprops/action-gh-release@v1
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Upload debug logs (新增：上传所有调试日志)
+      uses: actions/upload-artifact@main
+      if: !cancelled()
+      with:
+        name: Compile_Debug_Logs_${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: |
+          openwrt/diy_part1.log
+          openwrt/diy_part2.log
+          openwrt/feeds_update.log
+          openwrt/feeds_install.log
+          openwrt/download.log
+          openwrt/compile.log
+          openwrt/rtp2httpd_install.log
+        retention-days: 7
+
+    - name: Delete workflow runs (复用模板逻辑)
+      uses: GitRML/delete-workflow-runs@main
+      with:
+        retain_days: 1
+        keep_minimum_runs: 3
